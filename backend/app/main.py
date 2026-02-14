@@ -1,19 +1,28 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from google import genai
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+import os
+
+load_dotenv()
 
 app = FastAPI(title="Guardian Check-In API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://localhost:4173",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -137,9 +146,39 @@ class AlertResponse(BaseModel):
     created_at: datetime
 
 
+class ScreeningResponseItem(BaseModel):
+    q: str
+    answer: Optional[bool] = None
+    transcript: Optional[str] = None
+
+
+class ScreeningSession(BaseModel):
+    session_id: str
+    senior_id: str
+    timestamp: datetime
+    responses: List[ScreeningResponseItem]
+
+
+class ScreeningCreateRequest(BaseModel):
+    session_id: Optional[str] = None
+    senior_id: str = "demo-senior"
+    timestamp: Optional[datetime] = None
+    responses: List[ScreeningResponseItem]
+
+
+class ScreeningCreateResponse(BaseModel):
+    session_id: str
+    stored_at: datetime
+
+
 class HealthStatus(BaseModel):
     status: str = Field(default="ok")
     time: datetime
+
+
+class EphemeralTokenResponse(BaseModel):
+    token: str
+    expires_at: datetime
 
 
 CHECKINS: Dict[str, Dict[str, object]] = {}
@@ -147,11 +186,35 @@ CHECKIN_UPLOADS: Dict[str, List[str]] = {}
 BASELINES: Dict[str, List[BaselineMetric]] = {}
 ALERTS: Dict[str, List[AlertResponse]] = {}
 WEEKLY_SUMMARIES: Dict[str, List[WeeklySummary]] = {}
+SCREENINGS: Dict[str, ScreeningSession] = {}
 
 
 @app.get("/health", response_model=HealthStatus)
 def health_check() -> HealthStatus:
     return HealthStatus(time=datetime.utcnow())
+
+
+@app.post("/auth/ephemeral", response_model=EphemeralTokenResponse)
+def create_ephemeral_token() -> EphemeralTokenResponse:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not set")
+
+    client = genai.Client(
+        api_key=api_key,
+        http_options={"api_version": "v1alpha"},
+    )
+
+    now = datetime.now(timezone.utc)
+    token = client.auth_tokens.create(
+        config={
+            "uses": 1,
+            "expire_time": now + timedelta(minutes=30),
+            "new_session_expire_time": now + timedelta(minutes=5),
+        }
+    )
+
+    return EphemeralTokenResponse(token=token.name, expires_at=now + timedelta(minutes=30))
 
 
 @app.post("/checkins/start", response_model=CheckinStartResponse)
@@ -320,6 +383,29 @@ def test_alert(payload: AlertRequest) -> AlertResponse:
 @app.get("/seniors/{senior_id}/alerts", response_model=List[AlertResponse])
 def list_alerts(senior_id: str) -> List[AlertResponse]:
     return ALERTS.get(senior_id, [])
+
+
+@app.post("/screenings", response_model=ScreeningCreateResponse)
+def create_screening(payload: ScreeningCreateRequest) -> ScreeningCreateResponse:
+    session_id = payload.session_id or f"screening-{uuid4()}"
+    timestamp = payload.timestamp or datetime.utcnow()
+    session = ScreeningSession(
+        session_id=session_id,
+        senior_id=payload.senior_id,
+        timestamp=timestamp,
+        responses=payload.responses,
+    )
+    print(session)
+    SCREENINGS[session_id] = session
+    return ScreeningCreateResponse(session_id=session_id, stored_at=datetime.utcnow())
+
+
+@app.get("/screenings/{session_id}", response_model=ScreeningSession)
+def get_screening(session_id: str) -> ScreeningSession:
+    session = SCREENINGS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Screening session not found")
+    return session
 
 
 def _triage(answers: Answers) -> tuple[TriageStatus, List[str]]:

@@ -1,6 +1,16 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { GoogleGenAI, Modality } from "@google/genai";
 
 const apiBase = "http://localhost:8000";
+const modelName = "gemini-2.5-flash-native-audio-preview-12-2025";
+const systemInstruction = `ROLE: You are a professional Medical Screening Assistant.
+OBJECTIVE: Conduct a brief well-being check by asking specific questions.
+RULES:
+1. Greet the user and ask: "How are you feeling today?"
+2. Follow up with: "Are you experiencing any dizziness, chest pain, or trouble breathing?"
+3. Finally ask: "Did you take your morning medications?"
+4. STRICT: Only ask these questions. If the user tries to change the subject, politely redirect them back to the screening.
+5. TERMINATION: Once all questions are answered, say exactly: "Thank you for your responses. The screening is now complete. Goodbye."`;
 
 const statusColor = {
   Green: "bg-emerald-100 text-moss",
@@ -10,10 +20,115 @@ const statusColor = {
   neutral: "bg-amber-50 text-stone-600"
 };
 
+const completionPhrase = "Thank you for your responses. The screening is now complete. Goodbye.";
+
+const createAudioBuffer = (audioContext, pcm16, sampleRate) => {
+  const floatData = new Float32Array(pcm16.length);
+  for (let i = 0; i < pcm16.length; i += 1) {
+    floatData[i] = Math.max(-1, Math.min(1, pcm16[i] / 32768));
+  }
+  const buffer = audioContext.createBuffer(1, floatData.length, sampleRate);
+  buffer.copyToChannel(floatData, 0);
+  return buffer;
+};
+
+const decodeBase64ToInt16 = (base64) => {
+  const binary = atob(base64);
+  const length = binary.length;
+  const bytes = new Uint8Array(length);
+  for (let i = 0; i < length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new Int16Array(bytes.buffer);
+};
+
+const encodeToBase64 = (int16) => {
+  const bytes = new Uint8Array(int16.buffer);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+};
+
+const resampleTo16k = (input, inputRate) => {
+  if (inputRate === 16000) {
+    return input;
+  }
+  const ratio = inputRate / 16000;
+  const newLength = Math.round(input.length / ratio);
+  const output = new Float32Array(newLength);
+  for (let i = 0; i < newLength; i += 1) {
+    const position = i * ratio;
+    const leftIndex = Math.floor(position);
+    const rightIndex = Math.min(leftIndex + 1, input.length - 1);
+    const weight = position - leftIndex;
+    output[i] = input[leftIndex] * (1 - weight) + input[rightIndex] * weight;
+  }
+  return output;
+};
+
+const floatToInt16 = (floatData) => {
+  const output = new Int16Array(floatData.length);
+  for (let i = 0; i < floatData.length; i += 1) {
+    const sample = Math.max(-1, Math.min(1, floatData[i]));
+    output[i] = sample < 0 ? sample * 32768 : sample * 32767;
+  }
+  return output;
+};
+
+const normalizeAnswer = (questionIndex, text) => {
+  if (!text) return null;
+  const textLower = text.toLowerCase();
+  const yesTerms = ["yes", "yeah", "yep", "affirmative", "true"];
+  const noTerms = ["no", "nope", "negative", "false"];
+
+  if (yesTerms.some((term) => textLower.includes(term))) return true;
+  if (noTerms.some((term) => textLower.includes(term))) return false;
+
+  if (questionIndex === 0) {
+    const positiveTerms = ["good", "fine", "okay", "ok", "well", "great", "better"];
+    const negativeTerms = ["bad", "not good", "sick", "unwell", "awful", "worse"];
+    if (positiveTerms.some((term) => textLower.includes(term))) return true;
+    if (negativeTerms.some((term) => textLower.includes(term))) return false;
+  }
+
+  return null;
+};
+
 export default function App() {
   const [status, setStatus] = useState(null);
   const [reason, setReason] = useState("Run a check-in to see triage output.");
   const [isDemoMode, setIsDemoMode] = useState(true);
+  const [voiceStatus, setVoiceStatus] = useState("Idle");
+  const [voiceLog, setVoiceLog] = useState([]);
+  const [isVoiceLive, setIsVoiceLive] = useState(false);
+
+  const sessionRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const processorRef = useRef(null);
+  const micStreamRef = useRef(null);
+  const isSessionOpenRef = useRef(false);
+  const audioQueueRef = useRef([]);
+  const isPlayingRef = useRef(false);
+  const lastAudioAtRef = useRef(null);
+  const heardAudioRef = useRef(false);
+  const completionSentRef = useRef(false);
+  const completionTimerRef = useRef(null);
+  const voiceStartAtRef = useRef(null);
+  const lastUserAudioAtRef = useRef(null);
+  const lastAiAudioAtRef = useRef(null);
+  const lastAiBurstAtRef = useRef(null);
+  const aiTurnCountRef = useRef(0);
+  const userSpeakingRef = useRef(false);
+  const userSpeechStartRef = useRef(null);
+  const currentQuestionIndexRef = useRef(0);
+  const responsesRef = useRef([
+    { q: "How are you feeling today?", answer: null, transcript: null },
+    { q: "Are you experiencing any dizziness, chest pain, or trouble breathing?", answer: null, transcript: null },
+    { q: "Did you take your morning medications?", answer: null, transcript: null }
+  ]);
+  const recognitionRef = useRef(null);
 
   const startCheckin = async () => {
     setStatus("Starting");
@@ -54,6 +169,284 @@ export default function App() {
     } catch (error) {
       setStatus("Error");
       setReason(error?.message || "Something went wrong.");
+    }
+  };
+
+  const cleanupAudio = async () => {
+    setIsVoiceLive(false);
+    if (completionTimerRef.current) {
+      clearInterval(completionTimerRef.current);
+      completionTimerRef.current = null;
+    }
+    lastAudioAtRef.current = null;
+    lastAiAudioAtRef.current = null;
+    lastAiBurstAtRef.current = null;
+    heardAudioRef.current = false;
+    completionSentRef.current = false;
+    aiTurnCountRef.current = 0;
+    userSpeakingRef.current = false;
+    userSpeechStartRef.current = null;
+    currentQuestionIndexRef.current = 0;
+    responsesRef.current = responsesRef.current.map((item) => ({ ...item, answer: null, transcript: null }));
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+      recognitionRef.current = null;
+    }
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((track) => track.stop());
+      micStreamRef.current = null;
+    }
+    if (audioContextRef.current) {
+      await audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+  };
+
+  const stopVoice = async () => {
+    setVoiceStatus("Stopping...");
+    isSessionOpenRef.current = false;
+    await cleanupAudio();
+    if (sessionRef.current) {
+      sessionRef.current.close();
+      sessionRef.current = null;
+    }
+    setVoiceStatus("Idle");
+  };
+
+  const handleCompletion = async () => {
+    const screeningData = {
+      session_id: `screening_${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      senior_id: "demo-senior",
+      responses: responsesRef.current
+    };
+
+    await fetch(`${apiBase}/screenings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(screeningData)
+    });
+  };
+
+  const playQueuedAudio = () => {
+    if (isPlayingRef.current) return;
+    const audioContext = audioContextRef.current;
+    if (!audioContext || audioQueueRef.current.length === 0) return;
+
+    const { pcm, sampleRate } = audioQueueRef.current.shift();
+    isPlayingRef.current = true;
+    const buffer = createAudioBuffer(audioContext, pcm, sampleRate);
+    const source = audioContext.createBufferSource();
+    source.buffer = buffer;
+    source.connect(audioContext.destination);
+    source.onended = () => {
+      isPlayingRef.current = false;
+      playQueuedAudio();
+    };
+    source.start();
+  };
+
+  const startVoice = async () => {
+    if (isVoiceLive) return;
+
+    setIsVoiceLive(true);
+    setVoiceStatus("Connecting...");
+    setVoiceLog([]);
+
+    try {
+      const tokenResponse = await fetch(`${apiBase}/auth/ephemeral`, { method: "POST" });
+      if (!tokenResponse.ok) {
+        throw new Error("Failed to fetch ephemeral token");
+      }
+      const tokenData = await tokenResponse.json();
+
+      const ai = new GoogleGenAI({
+        apiKey: tokenData.token,
+        httpOptions: { apiVersion: "v1alpha" }
+      });
+      const session = await ai.live.connect({
+        model: modelName,
+        httpOptions: { apiVersion: "v1alpha" },
+        config: {
+          responseModalities: [Modality.AUDIO],
+          systemInstruction
+        },
+        callbacks: {
+          onmessage: (message) => {
+            if (message.serverContent?.modelTurn?.parts) {
+              message.serverContent.modelTurn.parts.forEach((part) => {
+                if (part.inlineData?.data) {
+                  const audioContext = audioContextRef.current;
+                  if (!audioContext) return;
+                  const pcm = decodeBase64ToInt16(part.inlineData.data);
+                  lastAudioAtRef.current = Date.now();
+                  lastAiAudioAtRef.current = Date.now();
+                  if (!lastAiBurstAtRef.current || Date.now() - lastAiBurstAtRef.current > 1000) {
+                    aiTurnCountRef.current += 1;
+                    currentQuestionIndexRef.current = Math.min(aiTurnCountRef.current - 1, responsesRef.current.length - 1);
+                    console.log("[Live AI] Turn", aiTurnCountRef.current);
+                  }
+                  lastAiBurstAtRef.current = Date.now();
+                  heardAudioRef.current = true;
+                  audioQueueRef.current.push({ pcm, sampleRate: 24000 });
+                  playQueuedAudio();
+                }
+
+                if (part.text) {
+                  console.log("[Live AI]", part.text);
+                  setVoiceLog((prev) => [...prev, part.text]);
+                  if (part.text.includes(completionPhrase)) {
+                    console.log("[Live AI] Completion phrase detected. Posting screening payload.");
+                    handleCompletion().finally(() => {
+                      stopVoice();
+                    });
+                  }
+                }
+              });
+            }
+          },
+          onerror: (e) => {
+            setVoiceStatus("Error");
+            setVoiceLog((prev) => [...prev, `Error: ${e.message}`]);
+          },
+          onclose: (event) => {
+            isSessionOpenRef.current = false;
+            cleanupAudio();
+            setVoiceStatus("Closed");
+            if (event?.reason) {
+              setVoiceLog((prev) => [...prev, `Closed: ${event.reason}`]);
+            }
+          }
+        }
+      });
+
+      sessionRef.current = session;
+      isSessionOpenRef.current = true;
+      setVoiceStatus("Listening...");
+      voiceStartAtRef.current = Date.now();
+
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SpeechRecognition) {
+        const recognition = new SpeechRecognition();
+        recognition.continuous = true;
+        recognition.interimResults = false;
+        recognition.lang = "en-US";
+        recognition.onresult = (event) => {
+          const result = event.results[event.results.length - 1];
+          if (!result?.isFinal) return;
+          const transcript = result[0]?.transcript?.trim();
+          if (!transcript) return;
+          const idx = currentQuestionIndexRef.current;
+          const response = responsesRef.current[idx];
+          responsesRef.current[idx] = {
+            ...response,
+            transcript,
+            answer: normalizeAnswer(idx, transcript)
+          };
+          console.log("[User] Transcript", transcript);
+        };
+        recognition.onerror = (event) => {
+          console.warn("[User] Speech recognition error", event?.error);
+        };
+        recognition.start();
+        recognitionRef.current = recognition;
+      } else {
+        console.warn("[User] Speech recognition not supported in this browser.");
+      }
+
+      completionTimerRef.current = setInterval(() => {
+        if (!heardAudioRef.current || completionSentRef.current) {
+          return;
+        }
+        const lastAudioAt = lastAudioAtRef.current;
+        if (!lastAudioAt) return;
+        const idleMs = Date.now() - lastAudioAt;
+        const startedAt = voiceStartAtRef.current ?? 0;
+        const sessionMs = Date.now() - startedAt;
+        const lastAiAt = lastAiAudioAtRef.current;
+        const aiIdleMs = lastAiAt ? Date.now() - lastAiAt : 0;
+        if (aiTurnCountRef.current >= 4 && idleMs >= 4000 && aiIdleMs >= 4000 && sessionMs >= 15000) {
+          completionSentRef.current = true;
+          console.log("[Live AI] Silence detected. Posting screening payload.");
+          handleCompletion().finally(() => {
+            stopVoice();
+          });
+        }
+      }, 500);
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        micStreamRef.current = stream;
+
+        const audioContext = new AudioContext();
+        audioContextRef.current = audioContext;
+        if (audioContext.state === "suspended") {
+          await audioContext.resume();
+        }
+
+        const source = audioContext.createMediaStreamSource(stream);
+        const processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+        processor.onaudioprocess = (event) => {
+          if (!isSessionOpenRef.current || sessionRef.current !== session) {
+            return;
+          }
+          const input = event.inputBuffer.getChannelData(0);
+          let rms = 0;
+          for (let i = 0; i < input.length; i += 1) {
+            rms += input[i] * input[i];
+          }
+          rms = Math.sqrt(rms / input.length);
+          if (rms > 0.01) {
+            lastUserAudioAtRef.current = Date.now();
+            if (!userSpeakingRef.current) {
+              userSpeakingRef.current = true;
+              userSpeechStartRef.current = Date.now();
+              console.log("[User] Speech started");
+            }
+          } else if (userSpeakingRef.current) {
+            userSpeakingRef.current = false;
+            const startedAt = userSpeechStartRef.current ?? Date.now();
+            const durationMs = Date.now() - startedAt;
+            console.log("[User] Speech ended", `${Math.round(durationMs / 100) / 10}s`);
+            userSpeechStartRef.current = null;
+          }
+          const resampled = resampleTo16k(input, audioContext.sampleRate);
+          const pcm16 = floatToInt16(resampled);
+          const base64Audio = encodeToBase64(pcm16);
+          session.sendRealtimeInput({
+            audio: {
+              data: base64Audio,
+              mimeType: "audio/pcm;rate=16000"
+            }
+          });
+        };
+
+        source.connect(processor);
+        processor.connect(audioContext.destination);
+        processorRef.current = processor;
+
+        setTimeout(() => {
+          if (!isSessionOpenRef.current || sessionRef.current !== session) {
+            return;
+          }
+          session.sendRealtimeInput({
+            text: "Please start the screening with your greeting."
+          });
+        }, 200);
+      } catch (error) {
+        setVoiceStatus("Error");
+        setVoiceLog((prev) => [...prev, error?.message || "Mic setup failed."]);
+        stopVoice();
+      }
+    } catch (error) {
+      setVoiceStatus("Error");
+      setVoiceLog((prev) => [...prev, error?.message || "Voice setup failed."]);
+      setIsVoiceLive(false);
     }
   };
 
@@ -106,11 +499,29 @@ export default function App() {
             </button>
           </article>
           <article className="rounded-2xl border border-amber-100 bg-white p-6 shadow-card">
-            <h3 className="text-lg font-semibold">Voice Q&amp;A</h3>
-            <p className="mt-2 text-sm text-stone-600">ElevenLabs TTS + transcript placeholder.</p>
-            <button className="mt-4 rounded-xl border border-amber-200 px-4 py-2 text-sm text-stone-700">
-              Simulate Q&amp;A
-            </button>
+            <h3 className="text-lg font-semibold">Voice Q&amp;A (Live)</h3>
+            <p className="mt-2 text-sm text-stone-600">
+              {isVoiceLive ? `Status: ${voiceStatus}` : "Start the live voice assistant in-browser."}
+            </p>
+            <div className="mt-4 flex flex-wrap gap-3">
+              <button
+                className="rounded-xl border border-amber-200 px-4 py-2 text-sm text-stone-700"
+                onClick={startVoice}
+                disabled={isVoiceLive}
+              >
+                Start voice
+              </button>
+              <button
+                className="rounded-xl border border-amber-200 px-4 py-2 text-sm text-stone-700"
+                onClick={stopVoice}
+                disabled={!isVoiceLive}
+              >
+                Stop
+              </button>
+            </div>
+            <div className="mt-4 max-h-40 overflow-auto rounded-lg bg-amber-50/60 p-3 text-xs text-stone-700">
+              {voiceLog.length === 0 ? "No messages yet." : voiceLog.join("\n\n")}
+            </div>
           </article>
         </section>
       </main>
