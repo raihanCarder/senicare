@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 import ssl
@@ -11,29 +11,19 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from google import genai
 from dotenv import load_dotenv
-import pymongo
-
-from app.db import mongo_check
-from app.auth import (
-    authenticate_user,
-    create_access_token,
-    create_user,
-    ensure_user_indexes,
-    require_current_user,
-)
-
-# Load env from repo root (or backend/) when running locally.
-_backend_dir = Path(__file__).resolve().parent.parent  # backend/
-load_dotenv(_backend_dir / ".env", override=False)
-load_dotenv(_backend_dir.parent / ".env", override=False)
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="Guardian Check-In API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://localhost:4173",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -157,6 +147,33 @@ class AlertResponse(BaseModel):
     created_at: datetime
 
 
+class ScreeningResponseItem(BaseModel):
+    q: str
+    answer: Optional[bool] = None
+    transcript: Optional[str] = None
+
+
+class ScreeningSession(BaseModel):
+    session_id: str
+    senior_id: str
+    checkin_id: Optional[str] = None
+    timestamp: datetime
+    responses: List[ScreeningResponseItem]
+
+
+class ScreeningCreateRequest(BaseModel):
+    session_id: Optional[str] = None
+    senior_id: str = "demo-senior"
+    checkin_id: Optional[str] = None
+    timestamp: Optional[datetime] = None
+    responses: List[ScreeningResponseItem]
+
+
+class ScreeningCreateResponse(BaseModel):
+    session_id: str
+    stored_at: datetime
+
+
 class HealthStatus(BaseModel):
     status: str = Field(default="ok")
     time: datetime
@@ -189,11 +206,17 @@ class MeResponse(BaseModel):
     email: str
 
 
+class EphemeralTokenResponse(BaseModel):
+    token: str
+    expires_at: datetime
+
+
 CHECKINS: Dict[str, Dict[str, object]] = {}
 CHECKIN_UPLOADS: Dict[str, List[str]] = {}
 BASELINES: Dict[str, List[BaselineMetric]] = {}
 ALERTS: Dict[str, List[AlertResponse]] = {}
 WEEKLY_SUMMARIES: Dict[str, List[WeeklySummary]] = {}
+SCREENINGS: Dict[str, ScreeningSession] = {}
 
 
 @app.get("/health", response_model=HealthStatus)
@@ -236,6 +259,29 @@ def me(user: Optional[dict] = Depends(require_current_user)) -> MeResponse:
     if user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return MeResponse(email=user["email"])
+
+
+@app.post("/auth/ephemeral", response_model=EphemeralTokenResponse)
+def create_ephemeral_token() -> EphemeralTokenResponse:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not set")
+
+    client = genai.Client(
+        api_key=api_key,
+        http_options={"api_version": "v1alpha"},
+    )
+
+    now = datetime.now(timezone.utc)
+    token = client.auth_tokens.create(
+        config={
+            "uses": 1,
+            "expire_time": now + timedelta(minutes=30),
+            "new_session_expire_time": now + timedelta(minutes=5),
+        }
+    )
+
+    return EphemeralTokenResponse(token=token.name, expires_at=now + timedelta(minutes=30))
 
 
 @app.post("/checkins/start", response_model=CheckinStartResponse)
@@ -404,6 +450,30 @@ def test_alert(payload: AlertRequest) -> AlertResponse:
 @app.get("/seniors/{senior_id}/alerts", response_model=List[AlertResponse])
 def list_alerts(senior_id: str) -> List[AlertResponse]:
     return ALERTS.get(senior_id, [])
+
+
+@app.post("/screenings", response_model=ScreeningCreateResponse)
+def create_screening(payload: ScreeningCreateRequest) -> ScreeningCreateResponse:
+    session_id = payload.session_id or f"screening-{uuid4()}"
+    timestamp = payload.timestamp or datetime.utcnow()
+    session = ScreeningSession(
+        session_id=session_id,
+        senior_id=payload.senior_id,
+        checkin_id=payload.checkin_id,
+        timestamp=timestamp,
+        responses=payload.responses,
+    )
+    print(session)
+    SCREENINGS[session_id] = session
+    return ScreeningCreateResponse(session_id=session_id, stored_at=datetime.utcnow())
+
+
+@app.get("/screenings/{session_id}", response_model=ScreeningSession)
+def get_screening(session_id: str) -> ScreeningSession:
+    session = SCREENINGS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Screening session not found")
+    return session
 
 
 def _triage(answers: Answers) -> tuple[TriageStatus, List[str]]:

@@ -4,4 +4,6 @@ frontend/dist/
 backend/.venv/
 backend/__pycache__/
 backend/app/__pycache__/
+backend/voice/node_modules/
+backend/voice/.env
 .env
