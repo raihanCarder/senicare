@@ -15,6 +15,22 @@ from google import genai
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
+from app.auth import (
+    authenticate_user,
+    create_access_token,
+    create_user,
+    ensure_user_indexes,
+    require_current_user,
+)
+from app.db import mongo_check
+
+# Load env vars from repo root `.env` (and optionally `backend/.env`) for local dev.
+# Uvicorn doesn't auto-load dotenv files.
+_ROOT_ENV = Path(__file__).resolve().parents[2] / ".env"
+_BACKEND_ENV = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(_ROOT_ENV, override=False)
+load_dotenv(_BACKEND_ENV, override=False)
+
 app = FastAPI(title="Guardian Check-In API", version="0.1.0")
 
 app.add_middleware(
@@ -262,10 +278,14 @@ def me(user: Optional[dict] = Depends(require_current_user)) -> MeResponse:
 
 
 @app.post("/auth/ephemeral", response_model=EphemeralTokenResponse)
+@app.get("/auth/ephemeral", response_model=EphemeralTokenResponse)
 def create_ephemeral_token() -> EphemeralTokenResponse:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not set")
+        raise HTTPException(
+            status_code=500,
+            detail="GEMINI_API_KEY is not set (set it in your shell env or in the repo root .env)",
+        )
 
     client = genai.Client(
         api_key=api_key,
