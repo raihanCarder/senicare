@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 import json
+import logging
 import ssl
 import sys
 import os
@@ -39,6 +40,7 @@ from bson import ObjectId
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 app = FastAPI(title="Guardian Check-In API", version="0.1.0")
+logger = logging.getLogger("guardian")
 
 app.add_middleware(
     CORSMiddleware,
@@ -160,6 +162,35 @@ class WeeklySummary(BaseModel):
 class WeeklySummaryResponse(BaseModel):
     senior_id: str
     summary: WeeklySummary
+
+
+class ReportOverview(BaseModel):
+    total_checkins: int
+    last_checkin_at: Optional[str] = None
+    days_since_last_checkin: Optional[int] = None
+    triage_counts: Dict[str, int] = Field(default_factory=dict)
+    signal_counts: Dict[str, int] = Field(default_factory=dict)
+
+
+class ReportCheckinSummary(BaseModel):
+    completed_at: Optional[str] = None
+    triage_status: Optional[str] = None
+    triage_reasons: List[str] = []
+
+
+class SeniorReportSummaryRequest(BaseModel):
+    senior_id: str
+    senior_name: Optional[str] = None
+    senior_email: Optional[str] = None
+    overview: ReportOverview
+    recent_checkins: List[ReportCheckinSummary] = Field(default_factory=list)
+
+
+class SeniorReportSummaryResponse(BaseModel):
+    summary: str
+    symptoms: List[str] = Field(default_factory=list)
+    risks: List[str] = Field(default_factory=list)
+    follow_up: List[str] = Field(default_factory=list)
 
 
 class AlertLevel(str, Enum):
@@ -695,6 +726,7 @@ def dashboard_seniors(user: Optional[dict] = Depends(require_current_user)):
 def create_ephemeral_token() -> EphemeralTokenResponse:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
+        logger.error("Gemini API key missing for /auth/ephemeral")
         raise HTTPException(
             status_code=500,
             detail="GEMINI_API_KEY is not set (set it in your shell env or in the repo root .env)",
@@ -715,10 +747,13 @@ def create_ephemeral_token() -> EphemeralTokenResponse:
             }
         )
     except Exception as exc:
+        logger.exception("Failed to create Gemini ephemeral token")
         raise HTTPException(
             status_code=502,
             detail=f"Failed to create Gemini ephemeral token: {exc.__class__.__name__}",
         ) from exc
+
+    logger.info("Gemini ephemeral token created")
 
     return EphemeralTokenResponse(
         token=token.name, expires_at=now + timedelta(minutes=30)
@@ -990,6 +1025,96 @@ def get_weekly_summary(
         raise HTTPException(status_code=404, detail="Weekly summary not found")
 
     return WeeklySummaryResponse(senior_id=senior_id, summary=summaries[-1])
+
+
+@app.post("/reports/senior-summary", response_model=SeniorReportSummaryResponse)
+def generate_senior_summary(
+    payload: SeniorReportSummaryRequest,
+    user: Optional[dict] = Depends(require_current_user),
+) -> SeniorReportSummaryResponse:
+    _require_doctor(user)
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        logger.error("Gemini API key missing for /reports/senior-summary")
+        raise HTTPException(
+            status_code=500,
+            detail="GEMINI_API_KEY is not set (set it in your shell env or in the repo root .env)",
+        )
+
+    client = genai.Client(api_key=api_key)
+    prompt_payload = {
+        "senior": {
+            "id": payload.senior_id,
+            "name": payload.senior_name,
+            "email": payload.senior_email,
+        },
+        "overview": payload.overview.model_dump(),
+        "recent_checkins": [item.model_dump() for item in payload.recent_checkins],
+    }
+    prompt = (
+        "You are a clinical assistant helping a doctor review a senior's check-in history.\n"
+        "Return ONLY a JSON object with exactly these keys: summary, symptoms, risks, follow_up.\n"
+        "summary is a short sentence. symptoms, risks, follow_up are arrays of strings.\n"
+        "No markdown, no extra text, no code fences. Be concise, no diagnosis, "
+        "no speculation beyond the data. If data is limited, set summary to 'Limited data.' "
+        "and keep arrays short.\n\n"
+        f"DATA:\n{json.dumps(prompt_payload, indent=2)}"
+    )
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+        )
+    except Exception:
+        logger.exception("Failed to generate Gemini summary")
+        raise HTTPException(status_code=502, detail="Failed to generate AI summary")
+
+    raw_text = (getattr(response, "text", None) or "").strip()
+    if not raw_text:
+        logger.warning("Gemini summary empty for senior_id=%s", payload.senior_id)
+        return SeniorReportSummaryResponse(
+            summary="AI summary unavailable.",
+            symptoms=[],
+            risks=[],
+            follow_up=[],
+        )
+
+    if raw_text.startswith("```"):
+        raw_text = raw_text.strip("`")
+        raw_text = raw_text.replace("json", "", 1).strip()
+
+    json_start = raw_text.find("{")
+    json_end = raw_text.rfind("}")
+    if json_start == -1 or json_end == -1 or json_end <= json_start:
+        logger.warning("Gemini summary not JSON for senior_id=%s", payload.senior_id)
+        return SeniorReportSummaryResponse(
+            summary="AI summary unavailable.",
+            symptoms=[],
+            risks=[],
+            follow_up=[],
+        )
+
+    raw_text = raw_text[json_start : json_end + 1]
+
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError:
+        logger.exception("Gemini summary JSON parse failed")
+        return SeniorReportSummaryResponse(
+            summary="AI summary unavailable.",
+            symptoms=[],
+            risks=[],
+            follow_up=[],
+        )
+
+    return SeniorReportSummaryResponse(
+        summary=str(parsed.get("summary", "AI summary unavailable.")),
+        symptoms=list(parsed.get("symptoms", []) or []),
+        risks=list(parsed.get("risks", []) or []),
+        follow_up=list(parsed.get("follow_up", []) or []),
+    )
 
 
 @app.post("/alerts/test", response_model=AlertResponse)
