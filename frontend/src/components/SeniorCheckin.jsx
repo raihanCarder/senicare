@@ -12,9 +12,16 @@ function HeaderBar({ authUser, logout }) {
 
   return (
     <div className="flex items-center justify-between rounded-full border border-[#e8e2d8] bg-[#f7f7f7] px-4 py-2 text-sm text-stone-700">
-      <span className="font-medium">
-        <span className="font-semibold text-stone-900">Welcome,</span> {displayName}
-      </span>
+      <div className="flex items-center gap-2.5">
+        <img
+          src="/senicarelogo.png"
+          alt="SeniCare logo"
+          className="h-8 w-8 rounded-full object-cover"
+        />
+        <span className="font-medium">
+          <span className="font-semibold text-stone-900">Welcome,</span> {displayName}!
+        </span>
+      </div>
       <button
         type="button"
         onClick={logout}
