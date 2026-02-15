@@ -1,3 +1,5 @@
+import { useEffect, useRef, useState } from "react";
+
 import useCheckin from "../hooks/useCheckin.js";
 import { statusColor } from "../lib/screening.js";
 
@@ -14,6 +16,7 @@ export default function SeniorCheckin({ authUser, authToken, logout }) {
     facialSymmetryStatus,
     facialSymmetryReason,
     cameraVideoRef,
+    startCheckin,
     startVoice,
     stopVoice,
   } = useCheckin(authUser, authToken);
@@ -52,10 +55,9 @@ export default function SeniorCheckin({ authUser, authToken, logout }) {
           <div className="mt-6 flex flex-wrap items-center gap-4">
             <button
               className="rounded-full bg-clay px-6 py-3 text-base font-semibold text-white shadow-lg shadow-orange-200/60 transition hover:-translate-y-0.5"
-              onClick={startVoice}
-              disabled={isVoiceLive}
+              onClick={startCheckin}
             >
-              {isVoiceLive ? "Session running..." : "Start Check-In"}
+              Start Check-In
             </button>
             <label className="flex items-center gap-2 text-sm text-stone-700">
               <input
@@ -105,6 +107,13 @@ export default function SeniorCheckin({ authUser, authToken, logout }) {
               <div className="mt-4 flex flex-wrap gap-3">
                 <button
                   className="rounded-xl border border-amber-200 px-4 py-2 text-sm text-stone-700"
+                  onClick={startVoice}
+                  disabled={isVoiceLive}
+                >
+                  Start session
+                </button>
+                <button
+                  className="rounded-xl border border-amber-200 px-4 py-2 text-sm text-stone-700"
                   onClick={stopVoice}
                   disabled={!isVoiceLive}
                 >
@@ -132,7 +141,239 @@ export default function SeniorCheckin({ authUser, authToken, logout }) {
                 progress.
               </p>
             </div>
+            <p className="mt-2 text-xs font-medium text-[#fff6e8]">
+              {timerDone
+                ? "Finishing analysis..."
+                : isFaceScanActive
+                  ? "Analyzing face data for 10 seconds..."
+                  : "Loading Questions ..."}
+            </p>
           </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function ActionRow({
+  onStart,
+  onSecondary,
+  startDisabled,
+  secondaryDisabled,
+  startLabel,
+  secondaryLabel,
+}) {
+  return (
+    <div className="flex w-full max-w-md flex-wrap justify-center gap-3">
+      <button
+        type="button"
+        onClick={onStart}
+        disabled={startDisabled}
+        className="rounded-full bg-gradient-to-b from-[#e46535] to-[#d8542a] px-6 py-3 text-base font-semibold text-white shadow-[0_10px_18px_rgba(222,91,47,0.28)] transition hover:brightness-95 disabled:cursor-not-allowed disabled:opacity-70"
+      >
+        {startLabel}
+      </button>
+      <button
+        type="button"
+        onClick={onSecondary}
+        disabled={secondaryDisabled}
+        className="rounded-full border border-[#cfc4b6] bg-white px-6 py-3 text-base font-semibold text-stone-700 transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-60"
+      >
+        {secondaryLabel}
+      </button>
+    </div>
+  );
+}
+
+export default function SeniorCheckin({ authUser, authToken, logout }) {
+  const {
+    isVoiceLive,
+    isCheckinComplete,
+    cameraStatus,
+    cameraVideoRef,
+    startVoice,
+    stopVoice,
+  } = useCheckin(authUser, authToken);
+  const [phase, setPhase] = useState("idle");
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const [timerDone, setTimerDone] = useState(false);
+  const [isStartLocked, setIsStartLocked] = useState(false);
+  const [isPermissionChecking, setIsPermissionChecking] = useState(false);
+  const [permissionError, setPermissionError] = useState("");
+
+  const runStartAtRef = useRef(null);
+  const intervalRef = useRef(null);
+  const timeoutRef = useRef(null);
+  const startLockRef = useRef(false);
+
+  const clearRunTimers = () => {
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      clearRunTimers();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (phase !== "running") return;
+    if (cameraStatus !== "Recording 10s..." || runStartAtRef.current) return;
+
+    runStartAtRef.current = Date.now();
+    clearRunTimers();
+    intervalRef.current = window.setInterval(() => {
+      if (!runStartAtRef.current) return;
+      const elapsed = Math.min(
+        Date.now() - runStartAtRef.current,
+        FACE_CAPTURE_MS,
+      );
+      setElapsedMs(elapsed);
+    }, 100);
+    timeoutRef.current = window.setTimeout(() => {
+      setElapsedMs(FACE_CAPTURE_MS);
+      setTimerDone(true);
+      clearRunTimers();
+    }, FACE_CAPTURE_MS);
+  }, [cameraStatus, phase]);
+
+  useEffect(() => {
+    if (phase !== "running") return;
+    if (cameraStatus !== "Error") return;
+    setElapsedMs(FACE_CAPTURE_MS);
+    setTimerDone(true);
+  }, [cameraStatus, phase]);
+
+  useEffect(() => {
+    if (!isCheckinComplete || isVoiceLive) return;
+    clearRunTimers();
+    runStartAtRef.current = null;
+    setElapsedMs(FACE_CAPTURE_MS);
+    setTimerDone(true);
+    setPhase("complete");
+    setIsStartLocked(false);
+    setIsPermissionChecking(false);
+    setPermissionError("");
+    startLockRef.current = false;
+  }, [isCheckinComplete, isVoiceLive]);
+
+  useEffect(() => {
+    if (timerDone && CAMERA_DONE_STATUSES.has(cameraStatus)) {
+      setPhase("mascot");
+      setIsStartLocked(false);
+      startLockRef.current = false;
+      clearRunTimers();
+    }
+  }, [cameraStatus, timerDone]);
+
+  const handleStart = async () => {
+    if (startLockRef.current || isStartLocked || phase === "running") return;
+    setPermissionError("");
+    setIsPermissionChecking(true);
+
+    let preflightStream;
+    try {
+      if (!navigator?.mediaDevices?.getUserMedia) {
+        throw new Error("Media devices API is not available in this browser.");
+      }
+      preflightStream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true,
+      });
+    } catch (error) {
+      setPermissionError("Camera and microphone access is required to start.");
+      setIsPermissionChecking(false);
+      return;
+    } finally {
+      if (preflightStream) {
+        preflightStream.getTracks().forEach((track) => track.stop());
+      }
+    }
+
+    setIsPermissionChecking(false);
+    startLockRef.current = true;
+    setIsStartLocked(true);
+    setPhase("running");
+    setElapsedMs(0);
+    setTimerDone(false);
+    runStartAtRef.current = null;
+    clearRunTimers();
+    void startVoice();
+  };
+
+  const handleSecondary = async () => {
+    if (isVoiceLive) {
+      await stopVoice();
+    }
+    clearRunTimers();
+    runStartAtRef.current = null;
+    setElapsedMs(0);
+    setTimerDone(false);
+    setPhase("idle");
+    setIsStartLocked(false);
+    setIsPermissionChecking(false);
+    setPermissionError("");
+    startLockRef.current = false;
+  };
+
+  const progressPercent = Math.round(
+    (Math.min(elapsedMs, FACE_CAPTURE_MS) / FACE_CAPTURE_MS) * 100,
+  );
+  const isRunning = phase === "running";
+  const showMascot = phase === "mascot";
+  const isComplete = phase === "complete";
+  const isFaceScanActive = isRunning && cameraStatus === "Recording 10s...";
+
+  if (isComplete) {
+    return <CompletionScreen />;
+  }
+
+  return (
+    <div className={PAGE_SHELL_CLASS}>
+      <main className="mx-auto flex min-h-[calc(100svh-1rem)] w-full max-w-5xl flex-col sm:min-h-[calc(100svh-1.5rem)]">
+        <HeaderBar authUser={authUser} logout={logout} />
+
+        <section className="mx-auto flex w-full max-w-3xl flex-1 flex-col items-center justify-center gap-5 py-6 sm:gap-6">
+          <HeroStage
+            showMascot={showMascot}
+            cameraVideoRef={cameraVideoRef}
+            isRunning={isRunning}
+            progressPercent={progressPercent}
+            timerDone={timerDone}
+            isFaceScanActive={isFaceScanActive}
+          />
+
+          <ActionRow
+            onStart={handleStart}
+            onSecondary={handleSecondary}
+            startDisabled={isVoiceLive || isStartLocked || isPermissionChecking}
+            secondaryDisabled={!isVoiceLive && !showMascot && !isRunning}
+            startLabel={
+              isPermissionChecking
+                ? "Checking Access..."
+                : showMascot
+                  ? "Start Again"
+                  : isRunning
+                    ? "Running..."
+                    : "Start Check-In"
+            }
+            secondaryLabel={
+              isVoiceLive || isRunning ? "Stop Session" : "Show Camera"
+            }
+          />
+
+          {permissionError ? (
+            <p className="text-center text-sm font-medium text-rose-700">
+              {permissionError}
+            </p>
+          ) : null}
         </section>
       </main>
     </div>
