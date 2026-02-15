@@ -383,19 +383,65 @@ export default function App() {
     setVoiceStatus("Idle");
   };
 
+  const parseSymptomTranscript = (text) => {
+    if (!text) return { dizziness: false, chest_pain: false, trouble_breathing: false };
+    const lower = text.toLowerCase();
+    return {
+      dizziness: lower.includes("dizz"),
+      chest_pain: lower.includes("chest"),
+      trouble_breathing: lower.includes("breath") || lower.includes("breathing") || lower.includes("shortness"),
+    };
+  };
+
+  const buildTranscript = (responses) =>
+    responses
+      .map((item) => {
+        const parts = [];
+        if (item?.q) parts.push(`AI: ${item.q}`);
+        if (item?.transcript) parts.push(`USER: ${item.transcript}`);
+        return parts.join(" ");
+      })
+      .filter(Boolean)
+      .join(" ");
+
   const handleCompletion = async () => {
+    const responses = responsesRef.current;
     const screeningData = {
       session_id: `screening_${Date.now()}`,
       timestamp: new Date().toISOString(),
       senior_id: "demo-senior",
       checkin_id: checkinIdRef.current,
-      responses: responsesRef.current,
+      responses,
     };
 
     await fetch(`${apiBase}/screenings`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(screeningData),
+    });
+
+    if (!checkinIdRef.current) return;
+
+    const symptomResponse = responses[1] || {};
+    const symptomTranscript = symptomResponse.transcript || "";
+    const parsedSymptoms = parseSymptomTranscript(symptomTranscript);
+    const symptomAnswer = symptomResponse.answer;
+
+    const answers = {
+      dizziness:
+        parsedSymptoms.dizziness ||
+        (symptomAnswer === true && !parsedSymptoms.chest_pain && !parsedSymptoms.trouble_breathing),
+      chest_pain: parsedSymptoms.chest_pain,
+      trouble_breathing: parsedSymptoms.trouble_breathing,
+      medication_taken: responses[2]?.answer ?? null,
+    };
+
+    const transcript = buildTranscript(responses);
+
+    await fetch(`${apiBase}/checkins/${checkinIdRef.current}/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answers, transcript }),
     });
   };
 
