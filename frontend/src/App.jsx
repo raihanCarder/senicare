@@ -107,6 +107,10 @@ export default function App() {
   const [voiceLog, setVoiceLog] = useState([]);
   const [isVoiceLive, setIsVoiceLive] = useState(false);
   const [cameraStatus, setCameraStatus] = useState("Idle");
+  const [facialSymmetryStatus, setFacialSymmetryStatus] = useState("Not run");
+  const [facialSymmetryReason, setFacialSymmetryReason] = useState(
+    "Facial symmetry results will appear after camera upload."
+  );
 
   const sessionRef = useRef(null);
   const audioContextRef = useRef(null);
@@ -296,9 +300,25 @@ export default function App() {
       body: formData
     });
     if (!response.ok) {
-      throw new Error("Failed to upload camera clip");
+      let detail = "Failed to upload camera clip";
+      try {
+        const payload = await response.json();
+        if (payload?.detail) detail = String(payload.detail);
+      } catch {
+        // Keep default detail when response body is not JSON.
+      }
+      throw new Error(detail);
+    }
+    const data = await response.json();
+    if (!data?.facial_symmetry) {
+      const detailResponse = await fetch(`${apiBase}/checkins/${checkinId}`);
+      if (detailResponse.ok) {
+        const detailData = await detailResponse.json();
+        data.facial_symmetry = detailData?.facial_symmetry ?? null;
+      }
     }
     setCameraStatus("Uploaded");
+    return data;
   };
 
   const playQueuedAudio = () => {
@@ -325,6 +345,8 @@ export default function App() {
     setIsVoiceLive(true);
     setVoiceStatus("Connecting...");
     setVoiceLog([]);
+    setFacialSymmetryStatus("Pending");
+    setFacialSymmetryReason("Camera capture in progress. Waiting for backend analysis.");
 
     try {
       const checkinResponse = await fetch(`${apiBase}/checkins/start`, {
@@ -419,14 +441,35 @@ export default function App() {
       }
 
       session.sendRealtimeInput({
-        text: "Please ask the user to look at their camera for 10 seconds and wait for my 'camera done' signal before asking questions."
+        text: "Tell the user now: 'We are collecting your face data for the next 10 seconds. Please keep your face centered and still.' Then wait for my camera done signal before asking screening questions."
       });
+      setVoiceLog((prev) => [
+        ...prev,
+        "Collecting face data for 10 seconds. Please keep your face centered and still."
+      ]);
 
       try {
         const videoBlob = await captureCameraClip();
-        await uploadCameraClip(checkinIdRef.current, videoBlob);
+        const uploadResult = await uploadCameraClip(checkinIdRef.current, videoBlob);
+        const facialSymmetry = uploadResult?.facial_symmetry;
+        if (facialSymmetry?.status) {
+          const prefix =
+            facialSymmetry.status === "ERROR"
+              ? "Facial symmetry unavailable"
+              : `Facial symmetry ${facialSymmetry.status}`;
+          const detail = facialSymmetry.reason || "No details returned.";
+          setFacialSymmetryStatus(facialSymmetry.status);
+          setFacialSymmetryReason(detail);
+          setVoiceLog((prev) => [...prev, `${prefix}: ${detail}`]);
+        } else {
+          setFacialSymmetryStatus("Missing");
+          setFacialSymmetryReason("No facial symmetry payload was returned from backend.");
+          setVoiceLog((prev) => [...prev, "Facial symmetry result missing from backend response."]);
+        }
       } catch (error) {
         setCameraStatus("Error");
+        setFacialSymmetryStatus("Error");
+        setFacialSymmetryReason(error?.message || "Camera capture/upload failed.");
         setVoiceLog((prev) => [...prev, error?.message || "Camera capture failed."]);
       }
 
@@ -598,6 +641,8 @@ export default function App() {
                 {isVoiceLive ? `Voice status: ${voiceStatus}` : "Start the live voice assistant to begin."}
               </p>
               <p className="mt-1 text-xs text-stone-500">Camera status: {cameraStatus}</p>
+              <p className="mt-1 text-xs text-stone-500">Facial symmetry: {facialSymmetryStatus}</p>
+              <p className="mt-1 text-xs text-stone-500">{facialSymmetryReason}</p>
               <div className="mt-4 flex flex-wrap gap-3">
                 <button
                   className="rounded-xl border border-amber-200 px-4 py-2 text-sm text-stone-700"
