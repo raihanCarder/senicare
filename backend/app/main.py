@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -9,6 +10,7 @@ import os
 from typing import Dict, List, Optional
 from uuid import uuid4
 
+import pymongo
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
@@ -28,6 +30,7 @@ from app.db import (
     get_latest_checkins,
     get_senior_users,
 )
+from app.vhr import analyze_uploaded_video, warmup_open_rppg_model
 
 # Load env vars from repo root `.env` (and optionally `backend/.env`) for local dev.
 # Uvicorn doesn't auto-load dotenv files.
@@ -84,10 +87,31 @@ class CheckinResult(BaseModel):
     completed_at: datetime
 
 
+class VhrTiming(BaseModel):
+    upload_write: Optional[float] = None
+    preprocess: Optional[float] = None
+    analysis: Optional[float] = None
+    total: Optional[float] = None
+
+
+class VhrAnalysis(BaseModel):
+    avg_hr_bpm: Optional[float] = None
+    hr_quality: str = "low"
+    usable_seconds: float = 0.0
+    bpm_series: List[float] = Field(default_factory=list)
+    engine: str = "open-rppg"
+    sqi: Optional[float] = None
+    note: Optional[str] = None
+    timing_ms: Optional[VhrTiming] = None
+    upload_mb: Optional[float] = None
+
+
 class CheckinUploadResponse(BaseModel):
     checkin_id: str
     uploaded_at: datetime
     files: List[str]
+    metadata: Optional[Dict[str, object]] = None
+    vhr: Optional[VhrAnalysis] = None
 
 
 class CheckinDetail(BaseModel):
@@ -97,8 +121,9 @@ class CheckinDetail(BaseModel):
     started_at: datetime
     completed_at: Optional[datetime] = None
     triage_status: Optional[TriageStatus] = None
-    triage_reasons: List[str] = []
+    triage_reasons: List[str] = Field(default_factory=list)
     transcript: Optional[str] = None
+    vhr: Optional[VhrAnalysis] = None
 
 
 class CheckinListResponse(BaseModel):
@@ -238,7 +263,7 @@ class EphemeralTokenResponse(BaseModel):
 
 
 CHECKINS: Dict[str, Dict[str, object]] = {}
-CHECKIN_UPLOADS: Dict[str, List[str]] = {}
+CHECKIN_UPLOADS: Dict[str, Dict[str, object]] = {}
 BASELINES: Dict[str, List[BaselineMetric]] = {}
 ALERTS: Dict[str, List[AlertResponse]] = {}
 WEEKLY_SUMMARIES: Dict[str, List[WeeklySummary]] = {}
@@ -265,6 +290,14 @@ def _startup() -> None:
         ensure_user_indexes()
     except Exception:
         pass
+
+    # Warm up VHR model once so the first upload doesn't pay full init cost.
+    try:
+        note = warmup_open_rppg_model()
+        if note:
+            print(f"[VHR] warmup warning: {note}")
+    except Exception as exc:
+        print(f"[VHR] warmup failed: {exc}")
 
 
 @app.post("/auth/register", response_model=MeResponse)
@@ -372,7 +405,7 @@ def start_checkin(payload: CheckinStartRequest) -> CheckinStartResponse:
 
 
 @app.post("/checkins/{checkin_id}/upload", response_model=CheckinUploadResponse)
-def upload_checkin_artifacts(
+async def upload_checkin_artifacts(
     checkin_id: str,
     video: Optional[UploadFile] = File(default=None),
     audio: Optional[UploadFile] = File(default=None),
@@ -384,21 +417,54 @@ def upload_checkin_artifacts(
         raise HTTPException(status_code=404, detail="Check-in not found")
 
     files: List[str] = []
+    parsed_metadata: Optional[Dict[str, object]] = None
+    vhr_result: Optional[dict[str, object]] = None
+
     if video is not None:
-        files.append(video.filename)
+        files.append(video.filename or "video")
+        vhr_result = await analyze_uploaded_video(video)
+        checkin["vhr"] = vhr_result
+
     if audio is not None:
-        files.append(audio.filename)
+        files.append(audio.filename or "audio")
+
     if frames:
-        files.extend([frame.filename for frame in frames])
+        files.extend([frame.filename or "frame" for frame in frames])
 
     if metadata:
-        files.append("metadata")
+        try:
+            parsed = json.loads(metadata)
+            if isinstance(parsed, dict):
+                parsed_metadata = parsed
+            else:
+                parsed_metadata = {"value": parsed}
+        except json.JSONDecodeError:
+            parsed_metadata = {"raw": metadata}
 
-    CHECKIN_UPLOADS[checkin_id] = files
+    if audio is not None:
+        await audio.close()
+    if frames:
+        for frame in frames:
+            await frame.close()
+
+    upload_record: Dict[str, object] = {
+        "uploaded_at": datetime.utcnow(),
+        "files": files,
+    }
+    if parsed_metadata is not None:
+        upload_record["metadata"] = parsed_metadata
+    if vhr_result is not None:
+        upload_record["vhr"] = vhr_result
+
+    CHECKIN_UPLOADS[checkin_id] = upload_record
+    checkin["latest_upload"] = upload_record
+
     return CheckinUploadResponse(
         checkin_id=checkin_id,
-        uploaded_at=datetime.utcnow(),
+        uploaded_at=upload_record["uploaded_at"],  # type: ignore[arg-type]
         files=files,
+        metadata=parsed_metadata,
+        vhr=vhr_result,
     )
 
 
@@ -442,6 +508,7 @@ def get_checkin(checkin_id: str) -> CheckinDetail:
         triage_status=checkin.get("triage_status"),
         triage_reasons=checkin.get("triage_reasons", []),
         transcript=checkin.get("transcript"),
+        vhr=checkin.get("vhr"),
     )
 
 
@@ -463,6 +530,7 @@ def list_checkins(senior_id: str, from_date: Optional[str] = None, to_date: Opti
                 triage_status=checkin.get("triage_status"),
                 triage_reasons=checkin.get("triage_reasons", []),
                 transcript=checkin.get("transcript"),
+                vhr=checkin.get("vhr"),
             )
         )
 

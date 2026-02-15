@@ -130,6 +130,7 @@ export default function App() {
   const [voiceLog, setVoiceLog] = useState([]);
   const [isVoiceLive, setIsVoiceLive] = useState(false);
   const [cameraStatus, setCameraStatus] = useState("Idle");
+  const [vhrResult, setVhrResult] = useState(null);
   const [doctorSeniors, setDoctorSeniors] = useState([]);
   const [doctorStats, setDoctorStats] = useState({
     total_seniors: 0,
@@ -407,6 +408,8 @@ export default function App() {
     if (!response.ok) {
       throw new Error("Failed to upload camera clip");
     }
+    const data = await response.json();
+    setVhrResult(data?.vhr || null);
     setCameraStatus("Uploaded");
   };
 
@@ -434,6 +437,7 @@ export default function App() {
     setIsVoiceLive(true);
     setVoiceStatus("Connecting...");
     setVoiceLog([]);
+    setVhrResult(null);
 
     try {
       const checkinResponse = await fetch(`${apiBase}/checkins/start`, {
@@ -895,6 +899,17 @@ export default function App() {
                 {isVoiceLive ? `Voice status: ${voiceStatus}` : "Start the live voice assistant to begin."}
               </p>
               <p className="mt-1 text-xs text-stone-500">Camera status: {cameraStatus}</p>
+              {vhrResult ? (
+                <div className="mt-2 rounded-lg border border-emerald-200 bg-emerald-50/60 p-3 text-xs text-emerald-900">
+                  <p>
+                    Estimated HR:{" "}
+                    {typeof vhrResult.avg_hr_bpm === "number" ? `${vhrResult.avg_hr_bpm} bpm` : "Unavailable"}
+                    {" · "}
+                    Quality: {vhrResult.hr_quality || "low"}
+                  </p>
+                  {vhrResult.note ? <p className="mt-1 text-emerald-800">{vhrResult.note}</p> : null}
+                </div>
+              ) : null}
               <div className="mt-4 flex flex-wrap gap-3">
                 <button
                   className="rounded-xl border border-amber-200 px-4 py-2 text-sm text-stone-700"
