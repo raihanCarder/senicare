@@ -1,5 +1,7 @@
 # SeniCare
 
+🏆 Winner of Best use of Gemini @ CtrlHackDel 2026
+
 Senior-friendly daily check-in app with:
 
 - webcam capture and facial symmetry analysis
