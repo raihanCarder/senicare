@@ -5,6 +5,14 @@ Minimal end-to-end demo for the `plan.md` flow:
 - Frontend (`frontend/`): Next.js page that records webcam + mic with `MediaRecorder`.
 - Backend (`backend/`): FastAPI endpoint that accepts video upload and runs `open-rppg`.
 
+Model used:
+
+- [`open-rppg`](https://github.com/KegangWangCCNU/open-rppg) by KegangWangCCNU for video-based remote photoplethysmography (rPPG) heart-rate estimation.
+
+How it works (demo summary):
+
+- The model doesn’t directly guess BPM from the video. It tracks the face, extracts tiny skin color pulsations over time, builds a pulse waveform, then converts waveform frequency to BPM. It also outputs signal quality (`SQI`), which we map to `hr_quality`.
+
 ## Run It
 
 Use two terminals: one for backend, one for frontend.
