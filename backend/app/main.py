@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
+import json
 import ssl
 import sys
 import os
-from typing import Dict, List, Optional
+import tempfile
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
@@ -80,6 +82,26 @@ class CheckinUploadResponse(BaseModel):
     checkin_id: str
     uploaded_at: datetime
     files: List[str]
+    facial_symmetry: Optional["FacialSymmetryResult"] = None
+
+
+class FacialSymmetrySummary(BaseModel):
+    duration_s: float
+    total_frames: int
+    valid_frames: int
+    quality_ratio: float
+    symmetry_mean: Optional[float] = None
+    symmetry_std: Optional[float] = None
+    symmetry_p90: Optional[float] = None
+
+
+class FacialSymmetryResult(BaseModel):
+    status: str
+    reason: str
+    combined_index: Optional[float] = None
+    rollups: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    summary: Optional[FacialSymmetrySummary] = None
+    error: Optional[str] = None
 
 
 class CheckinDetail(BaseModel):
@@ -91,6 +113,7 @@ class CheckinDetail(BaseModel):
     triage_status: Optional[TriageStatus] = None
     triage_reasons: List[str] = []
     transcript: Optional[str] = None
+    facial_symmetry: Optional[FacialSymmetryResult] = None
 
 
 class CheckinListResponse(BaseModel):
@@ -227,12 +250,157 @@ class EphemeralTokenResponse(BaseModel):
     expires_at: datetime
 
 
+CheckinUploadResponse.model_rebuild()
+
+
 CHECKINS: Dict[str, Dict[str, object]] = {}
 CHECKIN_UPLOADS: Dict[str, List[str]] = {}
 BASELINES: Dict[str, List[BaselineMetric]] = {}
 ALERTS: Dict[str, List[AlertResponse]] = {}
 WEEKLY_SUMMARIES: Dict[str, List[WeeklySummary]] = {}
 SCREENINGS: Dict[str, ScreeningSession] = {}
+
+
+def _parse_duration_ms(metadata: Optional[str]) -> int:
+    if not metadata:
+        return 10000
+    try:
+        payload = json.loads(metadata)
+    except json.JSONDecodeError:
+        return 10000
+    duration_ms = payload.get("duration_ms")
+    if duration_ms is None:
+        return 10000
+    try:
+        return max(1000, min(30000, int(duration_ms)))
+    except (TypeError, ValueError):
+        return 10000
+
+
+def _normalize_rollup_values(rollups: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for metric_name, metric_rollup in rollups.items():
+        metric_data: Dict[str, Any] = {}
+        for key, value in metric_rollup.items():
+            if isinstance(value, (int, float)):
+                metric_data[key] = float(value)
+            else:
+                metric_data[key] = value
+        normalized[metric_name] = metric_data
+    return normalized
+
+
+def _run_facial_symmetry(video_bytes: bytes, duration_ms: int) -> FacialSymmetryResult:
+    if not video_bytes:
+        return FacialSymmetryResult(
+            status="ERROR",
+            reason="Uploaded camera clip is empty.",
+            error="empty_video",
+        )
+
+    repo_root = Path(__file__).resolve().parents[2]
+    if str(repo_root) not in sys.path:
+        sys.path.append(str(repo_root))
+
+    try:
+        import cv2  # type: ignore
+        from run_facial_symmetry_checkin import classify_scientific_index
+        from vision.facial_symmetry import FacialSymmetryAnalyzer, summarize_session
+    except Exception as exc:
+        return FacialSymmetryResult(
+            status="ERROR",
+            reason="Facial symmetry dependencies are not available.",
+            error=f"{exc.__class__.__name__}: {exc}",
+        )
+
+    clip_seconds = duration_ms / 1000.0
+    fallback_fps = 30.0
+    cap = None
+    analyzer = None
+    temp_path = None
+    samples = []
+    frame_count = 0
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as temp_file:
+            temp_file.write(video_bytes)
+            temp_path = temp_file.name
+
+        cap = cv2.VideoCapture(temp_path)
+        if not cap.isOpened():
+            return FacialSymmetryResult(
+                status="ERROR",
+                reason="Uploaded camera clip could not be decoded.",
+                error="video_decode_failed",
+            )
+
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        has_valid_fps = fps >= 1.0
+        analyzer = FacialSymmetryAnalyzer(model_path=None)
+
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+
+            elapsed_s = (frame_count / fps) if has_valid_fps else (frame_count / fallback_fps)
+            if elapsed_s >= clip_seconds:
+                break
+
+            metrics = analyzer.process_frame(frame, elapsed_s)
+            if metrics is not None:
+                samples.append(metrics)
+            frame_count += 1
+
+        analyzed_duration_s = min(
+            clip_seconds,
+            (frame_count / fps) if has_valid_fps else (frame_count / fallback_fps),
+        )
+        summary = summarize_session(samples, duration_s=analyzed_duration_s)
+        triage, rollups, combined_index = classify_scientific_index(samples, sensitivity=1.0)
+        return FacialSymmetryResult(
+            status=triage["status"],
+            reason=triage["reason"],
+            combined_index=float(combined_index),
+            rollups=_normalize_rollup_values(rollups),
+            summary=FacialSymmetrySummary(
+                duration_s=float(summary.duration_s),
+                total_frames=int(summary.total_frames),
+                valid_frames=int(summary.valid_frames),
+                quality_ratio=float(summary.quality_ratio),
+                symmetry_mean=(
+                    float(summary.symmetry_mean)
+                    if summary.symmetry_mean is not None
+                    else None
+                ),
+                symmetry_std=(
+                    float(summary.symmetry_std)
+                    if summary.symmetry_std is not None
+                    else None
+                ),
+                symmetry_p90=(
+                    float(summary.symmetry_p90)
+                    if summary.symmetry_p90 is not None
+                    else None
+                ),
+            ),
+        )
+    except Exception as exc:
+        return FacialSymmetryResult(
+            status="ERROR",
+            reason="Facial symmetry analysis failed.",
+            error=f"{exc.__class__.__name__}: {exc}",
+        )
+    finally:
+        if analyzer is not None:
+            analyzer.close()
+        if cap is not None:
+            cap.release()
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
 @app.get("/health", response_model=HealthStatus)
@@ -339,12 +507,18 @@ def upload_checkin_artifacts(
         raise HTTPException(status_code=404, detail="Check-in not found")
 
     files: List[str] = []
+    facial_symmetry: Optional[FacialSymmetryResult] = None
+    duration_ms = _parse_duration_ms(metadata)
+
     if video is not None:
-        files.append(video.filename)
+        files.append(video.filename or "video")
+        video_bytes = video.file.read()
+        facial_symmetry = _run_facial_symmetry(video_bytes, duration_ms)
+        checkin["facial_symmetry"] = facial_symmetry.model_dump()
     if audio is not None:
-        files.append(audio.filename)
+        files.append(audio.filename or "audio")
     if frames:
-        files.extend([frame.filename for frame in frames])
+        files.extend([frame.filename or "frame" for frame in frames])
 
     if metadata:
         files.append("metadata")
@@ -354,6 +528,7 @@ def upload_checkin_artifacts(
         checkin_id=checkin_id,
         uploaded_at=datetime.utcnow(),
         files=files,
+        facial_symmetry=facial_symmetry,
     )
 
 
@@ -397,6 +572,7 @@ def get_checkin(checkin_id: str) -> CheckinDetail:
         triage_status=checkin.get("triage_status"),
         triage_reasons=checkin.get("triage_reasons", []),
         transcript=checkin.get("transcript"),
+        facial_symmetry=checkin.get("facial_symmetry"),
     )
 
 
@@ -420,6 +596,7 @@ def list_checkins(
                 triage_status=checkin.get("triage_status"),
                 triage_reasons=checkin.get("triage_reasons", []),
                 transcript=checkin.get("transcript"),
+                facial_symmetry=checkin.get("facial_symmetry"),
             )
         )
 
