@@ -423,7 +423,7 @@ def complete_checkin(
 
     # Check for blocking errors
     blocking_errors = [e for e in validation_errors if e.is_blocking]
-    if blocking_errors:
+    if blocking_errors and not force:
         error_messages = [f"{e.field}: {e.message}" for e in blocking_errors]
         raise HTTPException(
             status_code=422,
@@ -433,6 +433,12 @@ def complete_checkin(
                 "can_retry": True,
             },
         )
+    if blocking_errors and force:
+        # Allow completion, but preserve a note in the triage reasons.
+        triage_reasons = list(triage_reasons) + [
+            f"Validation warning (forced complete): {e.field}: {e.message}"
+            for e in blocking_errors
+        ]
 
     triage_status_db = triage_status.value.lower()
 
