@@ -28,7 +28,6 @@ This repository contains:
 11. [Testing and Validation](#testing-and-validation)
 12. [Troubleshooting](#troubleshooting)
 13. [Additional Docs](#additional-docs)
-14. [Current Limitations](#current-limitations)
 
 ## Project Overview
 
