@@ -1,7 +1,7 @@
 """Check-in management routes."""
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -166,6 +166,59 @@ def _load_checkin(checkin_id: str) -> Optional[Dict[str, object]]:
 
     CHECKINS[checkin_id] = checkin
     return checkin
+
+
+def _auto_complete_abandoned_checkin(checkin_id: str) -> bool:
+    """
+    Auto-complete an abandoned check-in if it has screening data.
+    Returns True if completed, False otherwise.
+    """
+    doc = get_checkins_collection().find_one({"checkin_id": checkin_id})
+    if not doc:
+        return False
+    
+    # Only auto-complete if still in_progress and has screening data
+    if doc.get("status") != "in_progress":
+        return False
+    
+    transcript = doc.get("transcript")
+    screening_responses = doc.get("screening_responses", [])
+    facial_symmetry_raw = doc.get("facial_symmetry_raw")
+    
+    # Need at least screening data to auto-complete
+    if not transcript and not screening_responses:
+        return False
+    
+    # Extract answers from transcript or use defaults
+    answers = Answers(
+        dizziness="dizziness" in (transcript or "").lower(),
+        chest_pain="chest pain" in (transcript or "").lower(),
+        trouble_breathing="trouble breathing" in (transcript or "").lower(),
+        medication_taken=None,
+    )
+    
+    facial_symmetry = None
+    if facial_symmetry_raw:
+        facial_symmetry = FacialSymmetryResult(**facial_symmetry_raw)
+    
+    triage_status, triage_reasons = merge_triage(answers, facial_symmetry)
+    completed_at = datetime.utcnow()
+    
+    get_checkins_collection().update_one(
+        {"checkin_id": checkin_id},
+        {
+            "$set": {
+                "status": "completed",
+                "completed_at": completed_at,
+                "triage_status": triage_status.value.lower(),
+                "triage_reasons": triage_reasons,
+                "answers": answers.model_dump(),
+                "user_message": "Check-in auto-completed from screening data.",
+            }
+        },
+    )
+    
+    return True
 
 
 @router.post("/start", response_model=CheckinStartResponse)
@@ -430,6 +483,60 @@ def validate_checkin(checkin_id: str):
         "has_facial_symmetry": facial_symmetry is not None,
         "has_screening": bool(screening_responses),
         "has_transcript": bool(transcript),
+    }
+
+
+@router.post("/{checkin_id}/auto-complete")
+def auto_complete_checkin(checkin_id: str):
+    """
+    Auto-complete an abandoned check-in that has screening data.
+    
+    This is useful for check-ins that were started and have screening/facial data
+    but were never explicitly completed via the /complete endpoint.
+    """
+    success = _auto_complete_abandoned_checkin(checkin_id)
+    if not success:
+        raise HTTPException(
+            status_code=422,
+            detail="Cannot auto-complete: check-in is already completed or lacks screening data",
+        )
+    
+    return {"checkin_id": checkin_id, "status": "auto-completed"}
+
+
+@router.post("/cleanup-abandoned")
+def cleanup_abandoned_checkins(max_age_hours: int = 24):
+    """
+    Cleanup abandoned check-ins by auto-completing those with screening data.
+    
+    Args:
+        max_age_hours: Only process check-ins older than this many hours
+    
+    Returns count of auto-completed check-ins.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    
+    # Find in_progress check-ins with screening data
+    query = {
+        "status": "in_progress",
+        "started_at": {"$lte": cutoff},
+        "$or": [
+            {"transcript": {"$ne": None, "$ne": ""}},
+            {"screening_responses": {"$exists": True, "$ne": []}},
+        ],
+    }
+    
+    docs = get_checkins_collection().find(query)
+    completed_count = 0
+    
+    for doc in docs:
+        checkin_id = doc.get("checkin_id")
+        if checkin_id and _auto_complete_abandoned_checkin(checkin_id):
+            completed_count += 1
+    
+    return {
+        "auto_completed": completed_count,
+        "max_age_hours": max_age_hours,
     }
 
 

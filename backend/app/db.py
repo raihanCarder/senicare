@@ -112,11 +112,18 @@ def get_senior_users(limit: int = 50) -> list[dict]:
 
 
 def get_latest_checkins(user_ids: list) -> dict:
+    """Get the most recent completed check-in for each user."""
     if not user_ids:
         return {}
     db = get_database()
     pipeline = [
-        {"$match": {"user_id": {"$in": user_ids}}},
+        {
+            "$match": {
+                "user_id": {"$in": user_ids},
+                "status": "completed",
+                "triage_status": {"$ne": None}  # Exclude incomplete check-ins
+            }
+        },
         {"$sort": {"completed_at": -1}},
         {
             "$group": {
@@ -162,7 +169,8 @@ def get_dashboard_analytics(days: int = 7) -> dict:
         {
             "$match": {
                 "user_id": {"$in": senior_ids},
-                "completed_at": {"$gte": cutoff}
+                "completed_at": {"$gte": cutoff},
+                "triage_status": {"$ne": None}  # Exclude null triage statuses
             }
         },
         {"$sort": {"completed_at": -1}},

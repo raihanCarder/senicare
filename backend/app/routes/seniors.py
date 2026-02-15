@@ -75,9 +75,20 @@ def _checkin_detail_from_doc(doc: dict) -> CheckinDetail:
 
 @router.get("/{senior_id}/checkins", response_model=CheckinListResponse)
 def list_checkins(
-    senior_id: str, from_date: Optional[str] = None, to_date: Optional[str] = None
+    senior_id: str,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    include_incomplete: bool = False,
 ) -> CheckinListResponse:
-    """List all check-ins for a senior."""
+    """
+    List all check-ins for a senior.
+    
+    Args:
+        senior_id: The senior's user ID
+        from_date: Optional start date filter (ISO format)
+        to_date: Optional end date filter (ISO format)
+        include_incomplete: If False (default), only returns completed check-ins with triage status
+    """
     items: List[CheckinDetail] = []
 
     try:
@@ -86,6 +97,12 @@ def list_checkins(
         raise HTTPException(status_code=400, detail="Invalid senior_id format")
 
     query: Dict[str, Any] = {"user_id": user_id}
+    
+    # Filter out incomplete check-ins by default
+    if not include_incomplete:
+        query["status"] = "completed"
+        query["triage_status"] = {"$ne": None}
+    
     date_filter = _parse_date_filter(from_date, to_date)
     if date_filter:
         query["completed_at"] = date_filter
