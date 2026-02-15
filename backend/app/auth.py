@@ -85,7 +85,7 @@ def get_user_by_email(email: str) -> Optional[dict]:
     return _users_collection().find_one({"email": email})
 
 
-def create_user(*, email: str, password: str) -> dict:
+def create_user(*, email: str, password: str, firstName: str, lastName: str) -> dict:
     users = _users_collection()
     try:
         existing = users.find_one({"email": email})
@@ -97,6 +97,9 @@ def create_user(*, email: str, password: str) -> dict:
     doc = {
         "email": email,
         "password_hash": hash_password(password),
+        "firstName": firstName,
+        "lastName": lastName,
+        "role": "senior",
         "created_at": datetime.utcnow(),
     }
     try:

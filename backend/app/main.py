@@ -17,19 +17,6 @@ from google import genai
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
-from app.auth import (
-    require_current_user,
-    ensure_user_indexes,
-    create_user,
-    authenticate_user,
-    create_access_token,
-)
-
-from app.db import mongo_check
-
-# Ensure backend/.env is loaded regardless of launch directory.
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-
 app = FastAPI(title="Guardian Check-In API", version="0.1.0")
 
 app.add_middleware(
@@ -227,6 +214,8 @@ class HealthStatus(BaseModel):
 
 
 class RegisterRequest(BaseModel):
+    firstName: str
+    lastName: str
     email: str
     password: str
 
@@ -243,6 +232,9 @@ class TokenResponse(BaseModel):
 
 class MeResponse(BaseModel):
     email: str
+    firstName: str = ""
+    lastName: str = ""
+    role: str = "senior"
 
 
 class EphemeralTokenResponse(BaseModel):
@@ -277,7 +269,9 @@ def _parse_duration_ms(metadata: Optional[str]) -> int:
         return 10000
 
 
-def _normalize_rollup_values(rollups: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def _normalize_rollup_values(
+    rollups: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
     normalized: Dict[str, Dict[str, Any]] = {}
     for metric_name, metric_rollup in rollups.items():
         metric_data: Dict[str, Any] = {}
@@ -343,7 +337,9 @@ def _run_facial_symmetry(video_bytes: bytes, duration_ms: int) -> FacialSymmetry
             if not ok:
                 break
 
-            elapsed_s = (frame_count / fps) if has_valid_fps else (frame_count / fallback_fps)
+            elapsed_s = (
+                (frame_count / fps) if has_valid_fps else (frame_count / fallback_fps)
+            )
             if elapsed_s >= clip_seconds:
                 break
 
@@ -357,7 +353,9 @@ def _run_facial_symmetry(video_bytes: bytes, duration_ms: int) -> FacialSymmetry
             (frame_count / fps) if has_valid_fps else (frame_count / fallback_fps),
         )
         summary = summarize_session(samples, duration_s=analyzed_duration_s)
-        triage, rollups, combined_index = classify_scientific_index(samples, sensitivity=1.0)
+        triage, rollups, combined_index = classify_scientific_index(
+            samples, sensitivity=1.0
+        )
         return FacialSymmetryResult(
             status=triage["status"],
             reason=triage["reason"],
@@ -431,8 +429,18 @@ def _startup() -> None:
 
 @app.post("/auth/register", response_model=MeResponse)
 def register(payload: RegisterRequest) -> MeResponse:
-    user = create_user(email=payload.email.strip().lower(), password=payload.password)
-    return MeResponse(email=user["email"])
+    user = create_user(
+        email=payload.email.strip().lower(),
+        password=payload.password,
+        firstName=payload.firstName,
+        lastName=payload.lastName,
+    )
+    return MeResponse(
+        email=user["email"],
+        firstName=user.get("firstName", ""),
+        lastName=user.get("lastName", ""),
+        role=user.get("role", "senior"),
+    )
 
 
 @app.post("/auth/login", response_model=TokenResponse)
@@ -448,14 +456,23 @@ def login(payload: LoginRequest) -> TokenResponse:
 def me(user: Optional[dict] = Depends(require_current_user)) -> MeResponse:
     if user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    return MeResponse(email=user["email"])
+    return MeResponse(
+        email=user["email"],
+        firstName=user.get("firstName", ""),
+        lastName=user.get("lastName", ""),
+        role=user.get("role", "senior"),
+    )
 
 
 @app.post("/auth/ephemeral", response_model=EphemeralTokenResponse)
+@app.get("/auth/ephemeral", response_model=EphemeralTokenResponse)
 def create_ephemeral_token() -> EphemeralTokenResponse:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not set")
+        raise HTTPException(
+            status_code=500,
+            detail="GEMINI_API_KEY is not set (set it in your shell env or in the repo root .env)",
+        )
 
     client = genai.Client(
         api_key=api_key,
