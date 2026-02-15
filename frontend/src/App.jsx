@@ -1,7 +1,11 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { GoogleGenAI, Modality } from "@google/genai";
 
-const apiBase = "http://localhost:8000";
+import { API_BASE } from "./lib/api.js";
+import * as Auth from "./lib/auth.js";
+import AuthPanel from "./Auth.jsx";
+
+const apiBase = API_BASE;
 const modelName = "gemini-2.5-flash-native-audio-preview-12-2025";
 const systemInstruction = `ROLE: You are a professional Medical Screening Assistant.
 OBJECTIVE: Conduct a brief well-being check by asking specific questions.
@@ -24,6 +28,8 @@ const statusColor = {
 };
 
 const completionPhrase = "Thank you for your responses. The screening is now complete. Goodbye.";
+
+const TOKEN_STORAGE_KEY = "guardian_checkin.jwt";
 
 const createAudioBuffer = (audioContext, pcm16, sampleRate) => {
   const floatData = new Float32Array(pcm16.length);
@@ -100,6 +106,23 @@ const normalizeAnswer = (questionIndex, text) => {
 };
 
 export default function App() {
+  const [authMode, setAuthMode] = useState("login"); // login | register
+  const [authFirstName, setAuthFirstName] = useState("");
+  const [authLastName, setAuthLastName] = useState("");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authUser, setAuthUser] = useState(null);
+  const [authToken, setAuthToken] = useState(() => {
+    try {
+      return localStorage.getItem(TOKEN_STORAGE_KEY);
+    } catch {
+      return null;
+    }
+  });
+  const [authStatus, setAuthStatus] = useState("idle"); // idle | loading
+  const [authError, setAuthError] = useState(null);
+  const isAuthed = Boolean(authToken && authUser?.email);
+
   const [status, setStatus] = useState(null);
   const [reason, setReason] = useState("Run a check-in to see triage output.");
   const [isDemoMode, setIsDemoMode] = useState(true);
@@ -136,6 +159,79 @@ export default function App() {
     { q: "Did you take your morning medications?", answer: null, transcript: null }
   ]);
   const recognitionRef = useRef(null);
+
+  const persistToken = (token) => {
+    setAuthToken(token);
+    try {
+      if (token) localStorage.setItem(TOKEN_STORAGE_KEY, token);
+      else localStorage.removeItem(TOKEN_STORAGE_KEY);
+    } catch {
+      // ignore
+    }
+  };
+
+  const refreshMe = async (token) => {
+    if (!token) {
+      setAuthUser(null);
+      return;
+    }
+    try {
+      const user = await Auth.me({ token });
+      setAuthUser(user);
+    } catch (err) {
+      // Token invalid or backend unavailable: drop token so the UI recovers.
+      persistToken(null);
+      setAuthUser(null);
+    }
+  };
+
+  useEffect(() => {
+    refreshMe(authToken);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const submitAuth = async (event) => {
+    event?.preventDefault?.();
+    setAuthError(null);
+    setAuthStatus("loading");
+    const firstName = authFirstName.trim();
+    const lastName = authLastName.trim();
+    const email = authEmail.trim().toLowerCase();
+    const password = authPassword;
+
+    try {
+      if (!email || !password) {
+        throw new Error("Email and password are required");
+      }
+
+      if (authMode === "register") {
+        if (!firstName || !lastName) {
+          throw new Error("First name and last name are required");
+        }
+        if(!email.includes("@gmail.com")) {
+          throw new Error("Please use a valid Gmail address");
+        }
+        await Auth.register({ firstName, lastName, email, password });
+      }
+
+      const { access_token } = await Auth.login({ email, password });
+      persistToken(access_token);
+      await refreshMe(access_token);
+      setAuthPassword("");      
+      setAuthFirstName("");
+      setAuthLastName("");    
+    } catch (err) {
+      setAuthError(err?.message || "Auth failed");
+    } finally {
+      setAuthStatus("idle");
+    }
+  };
+
+  const logout = () => {
+    persistToken(null);
+    setAuthUser(null);
+    setAuthError(null);
+  };
 
   const startCheckin = async () => {
     setStatus("Starting");
@@ -247,6 +343,7 @@ export default function App() {
     });
   };
 
+  
   const captureCameraClip = async () => {
     setCameraStatus("Recording 10s...");
     const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
@@ -480,8 +577,8 @@ export default function App() {
       }, 500);
 
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        micStreamRef.current = stream;
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          micStreamRef.current = stream;
 
         const audioContext = audioContextRef.current;
         if (!audioContext) {
@@ -553,9 +650,56 @@ export default function App() {
   const chipClass = statusColor[status] || statusColor.neutral;
   const chipText = status || "—";
 
+  if (!isAuthed) {
+    return (
+      <div className="min-h-screen bg-[radial-gradient(circle_at_top_left,_#f6efe5_0%,_#f4f0e8_40%,_#f8f2ed_100%)] text-ink">
+        <main className="mx-auto flex min-h-screen w-full max-w-3xl flex-col justify-center gap-8 px-6 pb-16 pt-12 sm:px-8">
+          <header className="text-center">
+            <p className="font-mono text-xs uppercase tracking-[0.2em] text-amber-700">Guardian Check-In</p>
+            <h1 className="mt-3 text-4xl font-semibold sm:text-5xl">Sign in to continue</h1>
+            <p className="mt-3 text-base text-stone-600">
+              Access the check-in dashboard after authentication.
+            </p>
+          </header>
+          <AuthPanel
+            authStatus={authStatus}
+            authToken={authToken}
+            authUser={authUser}
+            apiBase={apiBase}
+            refreshMe={refreshMe}
+            logout={logout}
+            submitAuth={submitAuth}
+            authMode={authMode}
+            setAuthMode={setAuthMode}
+            authFirstName={authFirstName}
+            setAuthFirstName={setAuthFirstName}
+            authLastName={authLastName}
+            setAuthLastName={setAuthLastName}
+            authEmail={authEmail}
+            setAuthEmail={setAuthEmail}
+            authPassword={authPassword}
+            setAuthPassword={setAuthPassword}
+            authError={authError}
+          />
+        </main>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_top_left,_#f6efe5_0%,_#f4f0e8_40%,_#f8f2ed_100%)] text-ink">
       <main className="mx-auto flex w-full max-w-5xl flex-col gap-8 px-6 pb-16 pt-12 sm:px-8">
+
+        <div className="flex items-center justify-between rounded-full border border-amber-200 bg-amber-50 px-4 py-2 text-sm text-stone-700">
+          <span>Logged in as <span className="font-semibold">{authUser?.firstName} {authUser?.lastName}</span></span>
+          <button
+            onClick={logout}
+            className="rounded-full bg-stone-900 px-4 py-2 text-sm font-semibold text-white hover:bg-stone-800"
+          >
+            Log out
+          </button>
+        </div>
+        
         <header className="rounded-[28px] border border-amber-100 bg-amber-50/80 p-8 shadow-hero backdrop-blur">
           <p className="font-mono text-xs uppercase tracking-[0.2em] text-amber-700">Guardian Check-In</p>
           <h1 className="mt-3 text-4xl font-semibold sm:text-5xl">Daily health check-in</h1>
@@ -580,6 +724,8 @@ export default function App() {
             </label>
           </div>
         </header>
+
+        
 
         <section className="rounded-2xl border border-amber-100 bg-white p-6 shadow-card">
           <h2 className="text-xl font-semibold">Status</h2>

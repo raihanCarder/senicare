@@ -204,6 +204,8 @@ class HealthStatus(BaseModel):
     jwt_configured: bool = Field(default=False)
 
 class RegisterRequest(BaseModel):
+    firstName: str
+    lastName: str
     email: str
     password: str
 
@@ -220,6 +222,9 @@ class TokenResponse(BaseModel):
 
 class MeResponse(BaseModel):
     email: str
+    firstName: str = ""
+    lastName: str = ""
+    role: str = "senior"
 
 
 class EphemeralTokenResponse(BaseModel):
@@ -259,8 +264,8 @@ def _startup() -> None:
 
 @app.post("/auth/register", response_model=MeResponse)
 def register(payload: RegisterRequest) -> MeResponse:
-    user = create_user(email=payload.email.strip().lower(), password=payload.password)
-    return MeResponse(email=user["email"])
+    user = create_user(email=payload.email.strip().lower(), password=payload.password, firstName=payload.firstName, lastName=payload.lastName)
+    return MeResponse(email=user["email"], firstName=user.get("firstName", ""), lastName=user.get("lastName", ""), role=user.get("role", "senior"))
 
 
 @app.post("/auth/login", response_model=TokenResponse)
@@ -274,7 +279,7 @@ def login(payload: LoginRequest) -> TokenResponse:
 def me(user: Optional[dict] = Depends(require_current_user)) -> MeResponse:
     if user is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    return MeResponse(email=user["email"])
+    return MeResponse(email=user["email"], firstName=user.get("firstName", ""), lastName=user.get("lastName", ""), role=user.get("role", "senior"))
 
 
 @app.post("/auth/ephemeral", response_model=EphemeralTokenResponse)
