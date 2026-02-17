@@ -1,6 +1,6 @@
 # SeniCare
 
-🏆 Winner of Best use of Gemini @ CtrlHackDel 2026
+🏆 Winner of Best use of Gemini API @ CtrlHackDel 2026
 
 Senior-friendly daily check-in app with:
 
